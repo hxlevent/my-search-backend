@@ -1,4 +1,4 @@
 Flask
-pymongo
+pymongo>=4.0
 flask-cors
 gunicorn
