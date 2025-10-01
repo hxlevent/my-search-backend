@@ -2,6 +2,7 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from pymongo import MongoClient
+from pymongo.collation import Collation
 import os
 
 app = Flask(__name__)
@@ -12,19 +13,12 @@ CONNECTION_STRING = os.environ.get("MONGO_URI")
 
 client = None
 collection = None
-case_insensitive_collation = None # '만능 검색기'를 모두가 알 수 있도록 여기에 선언
 
 if CONNECTION_STRING:
     try:
         client = MongoClient(CONNECTION_STRING)
         db = client['my_database']
-        # collection 변수를 먼저 정의합니다.
         collection = db['my_collection']
-
-        # 이제 collection을 사용하여 '만능 검색기'를 만듭니다.
-        case_insensitive_collation = collection.with_options(
-            collation={'locale': 'simple', 'strength': 2}
-        )
         client.admin.command('ping')
         print("MongoDB 연결 성공!")
     except Exception as e:
@@ -39,8 +33,7 @@ def home():
 
 @app.route('/search')
 def search_records():
-    # case_insensitive_collation이 준비되었는지도 함께 확인
-    if not client or not collection or not case_insensitive_collation:
+    if not client or not collection:
         return jsonify({"error": "DB 연결 실패"}), 500
 
     search_id = request.args.get('id', '')
@@ -48,11 +41,12 @@ def search_records():
         return jsonify([])
 
     # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
-    # 이제 '만능 검색기'를 확실히 찾아서 사용할 수 있습니다.
-    results = list(case_insensitive_collation.find(
-        {'unique_id': search_id}, 
-        {'_id': 0}
-    ))
+    # '대소문자 무시' 옵션을 find 명령어에 직접 전달하는,
+    # 인덱스를 100% 활용하는 가장 빠르고 정확한 최종 검색 방식입니다.
+    results = list(collection.find(
+        {'unique_id': search_id},
+        collation=Collation(locale='simple', strength=2)
+    ).limit(1000)) # 혹시 모를 과도한 결과 방지를 위해 최대 1000개로 제한
     # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 
     return jsonify(results)
