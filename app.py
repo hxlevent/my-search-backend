@@ -8,16 +8,21 @@ app = Flask(__name__)
 CORS(app)
 
 # MongoDB 연결 (보안을 위해 환경 변수 사용)
-CONNECTION_STRING = os.environ.get("MONGO_URI", "YOUR_FALLBACK_MONGO_URI") # Render에서 설정할 예정
+CONNECTION_STRING = os.environ.get("MONGO_URI")
 
 client = None
 collection = None
 
-if CONNECTION_STRING != "YOUR_FALLBACK_MONGO_URI":
+if CONNECTION_STRING:
     try:
         client = MongoClient(CONNECTION_STRING)
         db = client['my_database']
         collection = db['my_collection']
+        # 데이터베이스의 'unique_id' 필드에 대한 대소문자 구분 없는 인덱스를 사용하도록 collation 설정
+        # 2.5부에서 만든 인덱스를 직접 사용하라는 명령어입니다.
+        case_insensitive_collation = collection.with_options(
+            collation={'locale': 'simple', 'strength': 2}
+        )
         client.admin.command('ping')
         print("MongoDB 연결 성공!")
     except Exception as e:
@@ -32,8 +37,20 @@ def home():
 
 @app.route('/search')
 def search_records():
-    if not collection: return jsonify({"error": "DB 연결 실패"}), 500
+    if not client or not collection:
+        return jsonify({"error": "DB 연결 실패"}), 500
+
     search_id = request.args.get('id', '')
-    if not search_id: return jsonify([])
-    results = list(collection.find({'unique_id': {'$regex': f'^{search_id}$', '$options': 'i'}}, {'_id': 0}))
+    if not search_id:
+        return jsonify([])
+
+    # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+    # 가장 빠르고 효율적인 최종 검색 방식입니다.
+    # case_insensitive_collation을 사용하여 인덱스를 100% 활용합니다.
+    results = list(case_insensitive_collation.find(
+        {'unique_id': search_id}, 
+        {'_id': 0}
+    ))
+    # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+
     return jsonify(results)
