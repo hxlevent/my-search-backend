@@ -12,14 +12,16 @@ CONNECTION_STRING = os.environ.get("MONGO_URI")
 
 client = None
 collection = None
+case_insensitive_collation = None # '만능 검색기'를 모두가 알 수 있도록 여기에 선언
 
 if CONNECTION_STRING:
     try:
         client = MongoClient(CONNECTION_STRING)
         db = client['my_database']
+        # collection 변수를 먼저 정의합니다.
         collection = db['my_collection']
-        # 데이터베이스의 'unique_id' 필드에 대한 대소문자 구분 없는 인덱스를 사용하도록 collation 설정
-        # 2.5부에서 만든 인덱스를 직접 사용하라는 명령어입니다.
+
+        # 이제 collection을 사용하여 '만능 검색기'를 만듭니다.
         case_insensitive_collation = collection.with_options(
             collation={'locale': 'simple', 'strength': 2}
         )
@@ -37,7 +39,8 @@ def home():
 
 @app.route('/search')
 def search_records():
-    if not client or not collection:
+    # case_insensitive_collation이 준비되었는지도 함께 확인
+    if not client or not collection or not case_insensitive_collation:
         return jsonify({"error": "DB 연결 실패"}), 500
 
     search_id = request.args.get('id', '')
@@ -45,8 +48,7 @@ def search_records():
         return jsonify([])
 
     # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
-    # 가장 빠르고 효율적인 최종 검색 방식입니다.
-    # case_insensitive_collation을 사용하여 인덱스를 100% 활용합니다.
+    # 이제 '만능 검색기'를 확실히 찾아서 사용할 수 있습니다.
     results = list(case_insensitive_collation.find(
         {'unique_id': search_id}, 
         {'_id': 0}
