@@ -8,9 +8,7 @@ import os
 app = Flask(__name__)
 CORS(app)
 
-# MongoDB 연결 (보안을 위해 환경 변수 사용)
 CONNECTION_STRING = os.environ.get("MONGO_URI")
-
 client = None
 collection = None
 
@@ -24,8 +22,6 @@ if CONNECTION_STRING:
     except Exception as e:
         print(f"MongoDB 연결 실패: {e}")
         client = None
-else:
-    print("MONGO_URI 환경 변수가 설정되지 않았습니다.")
 
 @app.route('/')
 def home():
@@ -33,20 +29,21 @@ def home():
 
 @app.route('/search')
 def search_records():
-    if not client or not collection:
+    # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+    # "if not collection:" 오류를 "if collection is None:" 으로 수정한 최종 코드입니다.
+    if client is None or collection is None:
         return jsonify({"error": "DB 연결 실패"}), 500
+    # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 
     search_id = request.args.get('id', '')
     if not search_id:
         return jsonify([])
 
-    # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
     # '대소문자 무시' 옵션을 find 명령어에 직접 전달하는,
     # 인덱스를 100% 활용하는 가장 빠르고 정확한 최종 검색 방식입니다.
     results = list(collection.find(
         {'unique_id': search_id},
         collation=Collation(locale='simple', strength=2)
-    ).limit(1000)) # 혹시 모를 과도한 결과 방지를 위해 최대 1000개로 제한
-    # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+    ).limit(1000)) # 최대 1000개 결과로 제한
 
     return jsonify(results)
