@@ -1,33 +1,39 @@
-# app.py — 조회 API + CSV Replace 업로드(임시 스왑) + 인코딩/헤더 정규화
+# app.py — 검색 API + 관리자 CSV Replace(비동기) + 진행률 폴링
 
-import os, io, csv, time
+import os, io, csv, time, uuid, threading
 from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
-from pymongo import MongoClient, InsertOne
-from pymongo.errors import BulkWriteError
-from pymongo.collation import Collation
 from bson import json_util
+from pymongo import MongoClient, InsertOne
+from pymongo.write_concern import WriteConcern
 
+# ----------------------------
+# Flask / CORS
+# ----------------------------
 app = Flask(__name__)
-# 운영에서는 origin 제한을 권장: CORS(app, resources={r"/*": {"origins": ["https://<your-gh>.github.io"]}})
+# 운영에서는 origins를 GitHub Pages 도메인으로 제한 권장
+# CORS(app, resources={r"/*": {"origins": ["https://<your-gh>.github.io"]}})
 CORS(app)
 
-# ===== Mongo 연결 =====
+# ----------------------------
+# Mongo 연결 설정
+# ----------------------------
 CONNECTION_STRING = os.environ.get("MONGO_URI")
 DB_NAME = os.environ.get("MONGO_DB", "my_database")
 COLLECTION_NAME = os.environ.get("MONGO_COLLECTION", "my_collection")
 
-client = MongoClient(
-    CONNECTION_STRING,
-    serverSelectionTimeoutMS=5000,
-    connectTimeoutMS=20000,
-    socketTimeoutMS=600000,  # 10분
-    retryWrites=True,
-)
+client = None
 collection = None
+
 if CONNECTION_STRING:
     try:
-        client = MongoClient(CONNECTION_STRING, serverSelectionTimeoutMS=5000)
+        client = MongoClient(
+            CONNECTION_STRING,
+            serverSelectionTimeoutMS=5000,
+            connectTimeoutMS=20000,
+            socketTimeoutMS=600000,  # 긴 업로드 대비 10분
+            retryWrites=True,
+        )
         db = client[DB_NAME]
         collection = db[COLLECTION_NAME]
         client.admin.command("ping")
@@ -39,13 +45,40 @@ if CONNECTION_STRING:
 else:
     print("환경변수 MONGO_URI가 설정되지 않았습니다.")
 
-
+# ----------------------------
+# 공통 유틸
+# ----------------------------
 def dumps_json(obj):
     """ObjectId/Datetime 안전 직렬화 응답"""
     return Response(json_util.dumps(obj, ensure_ascii=False), mimetype="application/json")
 
+# 진행률 저장소 (인메모리)
+JOBS = {}  # job_id -> dict(status, phase, total_rows, processed_rows, inserted, skipped, started_at, ended_at, error, encoding)
 
-# ===== 기본/헬스 =====
+def _update_job(job_id, **kw):
+    if job_id in JOBS:
+        JOBS[job_id].update(kw)
+
+def _count_csv_lines_fast(path, encoding):
+    """헤더 1줄 제외한 데이터 라인 수(대략치)"""
+    cnt = 0
+    with open(path, "r", encoding=encoding, newline="") as f:
+        for _ in f:
+            cnt += 1
+    return max(0, cnt - 1)
+
+REQUIRED_HEADERS = {"unique_id", "날짜", "시간", "인증샷 시리얼넘버"}
+
+def _normalize_headers_map(raw_fields):
+    """
+    헤더 정규화 맵: 원본키 -> 정규키
+    '\ufeffunique_id' / ' 날짜 ' -> 'unique_id' / '날짜'
+    """
+    return { (f or ""): (f or "").strip().lstrip("\ufeff") for f in (raw_fields or []) }
+
+# ----------------------------
+# 헬스/루트
+# ----------------------------
 @app.get("/")
 def home():
     return "API 서버가 정상 작동 중입니다." if client else "DB 연결 실패"
@@ -58,15 +91,16 @@ def healthz():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-
-# ===== 조회 API =====
+# ----------------------------
+# 조회 API
+# ----------------------------
 @app.get("/search")
 def search_by_unique_id():
     """
     쿼리:
       - unique_id (또는 id) : 필수 (프론트에서 대문자 변환하여 호출 권장)
       - page / limit        : 선택 (기본 1, 200 / 최대 1000)
-    응답: [{unique_id, 날짜, 시간, 인증샷 시리얼넘버}] (ts로 정렬)
+    응답: [{unique_id, 날짜, 시간, 인증샷 시리얼넘버}] (날짜+시간 정렬)
     """
     if client is None or collection is None:
         return jsonify({"ok": False, "error": "DB 연결 실패"}), 500
@@ -85,9 +119,9 @@ def search_by_unique_id():
         limit = 200
     skip = (page - 1) * limit
 
+    # 날짜/시간을 ts로 파싱해 정렬 (0:39 → 00:39 패딩)
     pipeline = [
         {"$match": {"unique_id": unique_id}},
-        # '0:39' 같은 한 자리 시간을 '00:39'로 패딩 후 날짜+시간을 ts로 파싱
         {"$addFields": {
             "_padded_time": {
                 "$cond": [
@@ -121,10 +155,9 @@ def search_by_unique_id():
     docs = list(collection.aggregate(pipeline))
     return dumps_json(docs)
 
-
 @app.get("/search-serial")
 def search_by_serial():
-    """시리얼 정확 일치 검색"""
+    """시리얼 정확 일치 검색 (인덱스 없이도 동작; 데이터량 수준에서 충분)"""
     if client is None or collection is None:
         return jsonify({"ok": False, "error": "DB 연결 실패"}), 500
 
@@ -139,197 +172,220 @@ def search_by_serial():
     )
     return dumps_json(docs)
 
-
-# ===== 관리자 업로드(Replace) =====
-
-REQUIRED_HEADERS = {"unique_id", "날짜", "시간", "인증샷 시리얼넘버"}
-
-def _normalize_row_strict(row: dict) -> dict:
-    """필수 4컬럼만 사용, 공백 제거, unique_id 대문자화"""
-    return {
-        "unique_id": (row["unique_id"] or "").strip().upper(),
-        "날짜": (row["날짜"] or "").strip(),
-        "시간": (row["시간"] or "").strip(),
-        "인증샷 시리얼넘버": (row["인증샷 시리얼넘버"] or "").strip(),
-    }
-
-def _ensure_indexes(col, unique_serial: bool = False):
-    """조회 성능 및(선택) 시리얼 고유 보장"""
-    col.create_index("unique_id")
-    if unique_serial:
-        col.create_index("인증샷 시리얼넘버", unique=True)
-    else:
-        col.create_index("인증샷 시리얼넘버")
-
-def _open_csv_reader_with_fallback(file_storage, preferred_encoding="utf-8"):
-    """
-    UTF-8/UTF-8-SIG/CP949/EUC-KR 순으로 디코딩 시도.
-    성공하는 csv.DictReader와 사용 인코딩을 반환.
-    """
-    order = []
-    if preferred_encoding:
-        pe = preferred_encoding.lower()
-        if pe == "utf-8":
-            order = ["utf-8", "utf-8-sig", "cp949", "euc-kr"]
-        elif pe == "cp949":
-            order = ["cp949", "utf-8", "utf-8-sig", "euc-kr"]
-        else:
-            order = [pe, "utf-8", "utf-8-sig", "cp949", "euc-kr"]
-    else:
-        order = ["utf-8", "utf-8-sig", "cp949", "euc-kr"]
-
-    last_error = None
-    for enc in order:
-        try:
-            file_storage.stream.seek(0)
-            text = io.TextIOWrapper(file_storage.stream, encoding=enc, newline="")
-            reader = csv.DictReader(text)
-            _ = reader.fieldnames  # 헤더 로드해 디코딩 확인
-            return reader, enc
-        except UnicodeDecodeError as e:
-            last_error = e
-            continue
-    raise last_error or UnicodeDecodeError("encoding", b"", 0, 1, "unknown")
-
-def _normalize_headers(raw_fields):
-    """
-    헤더에서 BOM/앞뒤 공백 제거.
-    ['\\ufeffunique_id',' 날짜 '] -> ['unique_id','날짜']
-    """
-    raw_fields = raw_fields or []
-    norm = [ (f or "").strip().lstrip("\ufeff") for f in raw_fields ]
-    return norm
-
-
+# ----------------------------
+# 관리자 페이지(UI) — 비동기 업로드 + 진행률 표시
+# ----------------------------
 @app.get("/admin")
 def admin_form():
     return """
-<!doctype html>
-<meta charset="utf-8"><title>CSV 업로드 (Replace)</title>
+<!doctype html><meta charset="utf-8"><title>CSV 업로드(Replace)</title>
 <style>
-  body{font-family:sans-serif;padding:24px;max-width:720px;margin:0 auto}
-  input,button,select{font-size:16px;padding:6px}
+ body{font-family:sans-serif;padding:24px;max-width:720px;margin:0 auto}
+ .bar{height:14px;background:#e5e7eb;border-radius:7px;overflow:hidden}
+ .bar>i{display:block;height:100%;width:0;background:#38bdf8;transition:width .2s}
+ .row{margin:8px 0}
+ code{background:#f3f4f6;padding:2px 6px;border-radius:4px}
 </style>
-<h2>CSV 업로드 → MongoDB (전체 교체: Replace)</h2>
-<form action="/admin/upload-csv-replace" method="post" enctype="multipart/form-data">
-  <div>관리자 토큰: <input type="password" name="token" required></div><br>
-  <div>CSV 파일: <input type="file" name="file" accept=".csv,text/csv" required></div><br>
-  <div>인코딩:
-    <select name="encoding">
-      <option value="utf-8" selected>UTF-8</option>
-      <option value="cp949">CP949(엑셀-한글)</option>
-    </select>
-  </div><br>
-  <div>
-    시리얼 고유 인덱스(선택):
-    <label><input type="checkbox" name="unique_serial" value="1"> "인증샷 시리얼넘버"를 unique 인덱스로 생성</label>
-  </div><br>
-  <button type="submit">업로드 시작 (Replace)</button>
-</form>
-<p>CSV 헤더는 <code>unique_id, 날짜, 시간, 인증샷 시리얼넘버</code> 4개를 사용합니다(순서 무관).<br/>
-BOM이나 공백이 있어도 자동 정리합니다.</p>
+<h2>CSV 업로드 → MongoDB (전체 교체, 비동기)</h2>
+<div class="row">관리자 토큰<br/><input id="tok" type="password" style="width:100%"></div>
+<div class="row">CSV 파일(.csv 또는 .csv.gz)<br/><input id="file" type="file" accept=".csv,text/csv,.gz"></div>
+<div class="row">인코딩<br/><select id="enc"><option>utf-8</option><option>cp949</option></select></div>
+<button onclick="startUpload()">업로드 시작</button>
+<div id="prog" style="display:none;margin-top:16px">
+  <div>상태: <b id="phase">준비</b> · 진행: <b id="pct">0%</b></div>
+  <div class="bar"><i id="bar"></i></div>
+  <div class="row">처리 <span id="proc">0</span>/<span id="total">0</span> · 삽입 <span id="ins">0</span> · 스킵 <span id="skp">0</span></div>
+  <div class="row">경과 <span id="elap">0</span>s · 남은예상 <span id="eta">-</span>s</div>
+  <div id="err" style="color:#b91c1c"></div>
+</div>
+<script>
+let jobId=null, poll=null;
+function qs(i){return document.getElementById(i)}
+async function startUpload(){
+  const file = qs('file').files[0];
+  const tok  = qs('tok').value.trim();
+  const enc  = qs('enc').value;
+  if(!file||!tok){alert('토큰/파일을 입력하세요');return;}
+  const fd = new FormData();
+  fd.append('token', tok); fd.append('encoding', enc); fd.append('file', file);
+  const res = await fetch('/admin/upload-start',{method:'POST',body:fd});
+  const j = await res.json();
+  if(!j.ok){alert('실패: '+(j.error||'unknown'));return;}
+  jobId = j.job_id; qs('prog').style.display='block';
+  poll = setInterval(update, 1000);
+}
+async function update(){
+  const r = await fetch('/admin/job-status?id='+jobId);
+  const j = await r.json();
+  if(!j.ok){clearInterval(poll); qs('err').textContent=j.error||'오류'; return;}
+  const jb = j.job;
+  const pct = jb.total_rows ? Math.floor(jb.processed_rows*100/jb.total_rows) : 0;
+  qs('phase').textContent=jb.phase; qs('pct').textContent=pct+'%';
+  qs('bar').style.width=pct+'%'; qs('proc').textContent=jb.processed_rows;
+  qs('total').textContent=jb.total_rows; qs('ins').textContent=jb.inserted;
+  qs('skp').textContent=jb.skipped; qs('elap').textContent=jb.elapsed_secs;
+  qs('eta').textContent=(jb.eta_secs??'-');
+  if(jb.status==='done'||jb.status==='error'){clearInterval(poll);}
+  if(jb.status==='error'){qs('err').textContent=jb.error||'에러';}
+}
+</script>
 """
 
-
-@app.post("/admin/upload-csv-replace")
-def upload_csv_replace():
-    # 권한
+# ----------------------------
+# 업로드 시작 (비동기 잡 생성)
+# ----------------------------
+@app.post("/admin/upload-start")
+def admin_upload_start():
     token = (request.form.get("token") or request.headers.get("X-Admin-Token") or "").strip()
     if token != os.environ.get("ADMIN_TOKEN", ""):
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
     if client is None or collection is None:
         return jsonify({"ok": False, "error": "DB 연결 실패"}), 500
 
-    # 입력
     file = request.files.get("file")
     if not file:
         return jsonify({"ok": False, "error": "파일이 없습니다."}), 400
-    encoding = (request.form.get("encoding") or "utf-8").lower()
-    unique_serial = request.form.get("unique_serial") == "1"
 
-    db = collection.database
-    target_name = collection.name
-    temp_name   = f"{target_name}_tmp_{int(time.time())}"
-    backup_name = f"{target_name}_bak_{int(time.time())}"
+    enc = (request.form.get("encoding") or "utf-8").lower()
 
-    temp_col = db[temp_name]
-    inserted = skipped = 0
-    ops = []
-    batch_size = 500
+    # /tmp 로 저장 (비동기 처리를 위해)
+    job_id = uuid.uuid4().hex[:12]
+    tmp_path = f"/tmp/upload_{job_id}.csv"
+    file.save(tmp_path)
 
+    # 인코딩 간단 검증/보정
     try:
-        # 1) 인코딩 자동 시도 + 헤더 정규화
-        reader, used_enc = _open_csv_reader_with_fallback(file, preferred_encoding=encoding)
-        norm_fields = _normalize_headers(reader.fieldnames)
-        if not REQUIRED_HEADERS.issubset(set(norm_fields)):
-            return jsonify({
-                "ok": False,
-                "error": "CSV 헤더 불일치",
-                "required": sorted(REQUIRED_HEADERS),
-                "got": norm_fields,
-                "encoding_used": used_enc
-            }), 400
-
-        # 정규화된 헤더로 다시 Reader 구성 (BOM/공백 제거된 헤더 강제 적용)
-        file.stream.seek(0)
-        text_raw = io.TextIOWrapper(file.stream, encoding=used_enc, newline="")
-        header_line = text_raw.readline()  # 원본 헤더 라인 건너뛰기
-        rest = text_raw.read()
-        fixed_header = ",".join(norm_fields) + "\n"
-        fixed_text = io.StringIO(fixed_header + rest)
-        reader = csv.DictReader(fixed_text)
-
-        # 2) 임시 컬렉션 적재 ( streaming + bulk )
-        for row in reader:
-            # 다른 여분 컬럼은 무시하고 필수 4개만 사용
-            safe_row = {
-                "unique_id": row.get("unique_id", ""),
-                "날짜": row.get("날짜", ""),
-                "시간": row.get("시간", ""),
-                "인증샷 시리얼넘버": row.get("인증샷 시리얼넘버", "")
-            }
-            doc = _normalize_row_strict(safe_row)
-            # 필수값 검증(빈 값은 스킵)
-            if not doc["unique_id"] or not doc["날짜"] or not doc["시간"]:
-                skipped += 1
+        with open(tmp_path, "r", encoding=enc, newline="") as tf:
+            _ = tf.readline()
+    except UnicodeDecodeError:
+        for cand in ["utf-8", "utf-8-sig", "cp949", "euc-kr"]:
+            try:
+                with open(tmp_path, "r", encoding=cand, newline="") as tf:
+                    _ = tf.readline()
+                enc = cand
+                break
+            except UnicodeDecodeError:
                 continue
-            ops.append(InsertOne(doc))
-            if len(ops) >= batch_size:
-                res = temp_col.bulk_write(ops, ordered=False)
-                inserted += res.inserted_count
-                ops.clear()
-        if ops:
-            res = temp_col.bulk_write(ops, ordered=False)
+
+    total = _count_csv_lines_fast(tmp_path, enc)
+
+    JOBS[job_id] = {
+        "status": "running",
+        "phase": "parsing",
+        "total_rows": total,
+        "processed_rows": 0,
+        "inserted": 0,
+        "skipped": 0,
+        "started_at": time.time(),
+        "ended_at": None,
+        "error": None,
+        "encoding": enc,
+    }
+
+    threading.Thread(target=_run_replace_job, args=(job_id, tmp_path, enc), daemon=True).start()
+    return jsonify({"ok": True, "job_id": job_id, "total_rows": total, "encoding": enc})
+
+# ----------------------------
+# 진행 상태 조회
+# ----------------------------
+@app.get("/admin/job-status")
+def admin_job_status():
+    job_id = request.args.get("id", "")
+    job = JOBS.get(job_id)
+    if not job:
+        return jsonify({"ok": False, "error": "no such job"}), 404
+
+    elapsed = time.time() - job["started_at"] if job["started_at"] else 0
+    processed = max(1, job["processed_rows"])
+    rate = processed / max(1, elapsed)
+    remaining = max(0, job["total_rows"] - processed)
+    eta = int(remaining / rate) if rate > 0 else None
+
+    out = dict(job)
+    out["elapsed_secs"] = int(elapsed)
+    out["eta_secs"] = eta
+    return jsonify({"ok": True, "job": out})
+
+# ----------------------------
+# 실제 Replace 작업 (백그라운드)
+# ----------------------------
+def _run_replace_job(job_id, path, encoding):
+    try:
+        db = collection.database
+        target_name = collection.name
+        temp_name   = f"{target_name}_tmp_{int(time.time())}_{job_id}"
+        backup_name = f"{target_name}_bak_{int(time.time())}"
+
+        # writeConcern: w=1(안전). 초고속 원하면 w=0로도 가능(실패 감지 어려움)
+        temp_col = db.get_collection(temp_name, write_concern=WriteConcern(w=1))
+
+        batch = []
+        batch_size = 3000  # 데이터/네트워크 상황에 맞춰 2000~5000에서 조정
+        inserted = skipped = processed = 0
+
+        _update_job(job_id, phase="loading")
+
+        with open(path, "r", encoding=encoding, newline="") as f:
+            reader = csv.DictReader(f)
+            fmap = _normalize_headers_map(reader.fieldnames)
+            norm_set = set(fmap.values())
+            if not REQUIRED_HEADERS.issubset(norm_set):
+                raise ValueError(f"CSV 헤더 불일치: got={list(norm_set)}")
+
+            # 원본 헤더 키 → 정규키 매핑 기반으로 값 추출
+            def get(row, want):
+                for k, v in fmap.items():
+                    if v == want:
+                        return row.get(k, "")
+                return ""
+
+            for row in reader:
+                doc = {
+                    "unique_id": get(row, "unique_id").strip().upper(),
+                    "날짜": get(row, "날짜").strip(),
+                    "시간": get(row, "시간").strip(),
+                    "인증샷 시리얼넘버": get(row, "인증샷 시리얼넘버").strip(),
+                }
+                if not doc["unique_id"] or not doc["날짜"] or not doc["시간"]:
+                    skipped += 1
+                else:
+                    batch.append(InsertOne(doc))
+                    if len(batch) >= batch_size:
+                        res = temp_col.bulk_write(batch, ordered=False)
+                        inserted += res.inserted_count
+                        batch.clear()
+                processed += 1
+                _update_job(job_id, processed_rows=processed, inserted=inserted, skipped=skipped)
+
+        if batch:
+            res = temp_col.bulk_write(batch, ordered=False)
             inserted += res.inserted_count
-            ops.clear()
+            batch.clear()
+            _update_job(job_id, inserted=inserted)
 
-        # 3) 임시 컬렉션 인덱스
-        _ensure_indexes(temp_col, unique_serial=unique_serial)
+        # 인덱스: unique_id만(시리얼 인덱스는 생성하지 않음)
+        _update_job(job_id, phase="indexing")
+        temp_col.create_index("unique_id")
 
-        # 4) 스왑: 기존→백업, 임시→본컬렉션
+        # 스왑: 기존 → 백업, 임시 → 타깃
+        _update_job(job_id, phase="swapping")
         try:
             db[target_name].rename(backup_name, dropTarget=True)
         except Exception:
-            pass  # 기존이 없으면 무시
-        temp_col.rename(target_name, dropTarget=True)
+            pass
+        db[temp_name].rename(target_name, dropTarget=True)
 
-        return jsonify({
-            "ok": True,
-            "mode": "replace",
-            "inserted": inserted,
-            "skipped": skipped,
-            "backup": backup_name,
-            "encoding_used": used_enc
-        })
-
-    except BulkWriteError as bwe:
-        return jsonify({"ok": False, "error": "Bulk write error", "detail": bwe.details}), 500
-    except UnicodeDecodeError as e:
-        return jsonify({"ok": False, "error": str(e)}), 400
+        _update_job(job_id, status="done", phase="done", ended_at=time.time())
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        _update_job(job_id, status="error", phase="error", error=str(e), ended_at=time.time())
+    finally:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
 
-
+# ----------------------------
+# 로컬 실행
+# ----------------------------
 if __name__ == "__main__":
-    # 로컬 테스트용 (Render에서는 gunicorn 사용)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
