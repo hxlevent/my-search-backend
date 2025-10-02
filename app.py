@@ -17,7 +17,13 @@ CONNECTION_STRING = os.environ.get("MONGO_URI")
 DB_NAME = os.environ.get("MONGO_DB", "my_database")
 COLLECTION_NAME = os.environ.get("MONGO_COLLECTION", "my_collection")
 
-client = None
+client = MongoClient(
+    CONNECTION_STRING,
+    serverSelectionTimeoutMS=5000,
+    connectTimeoutMS=20000,
+    socketTimeoutMS=600000,  # 10분
+    retryWrites=True,
+)
 collection = None
 if CONNECTION_STRING:
     try:
@@ -249,7 +255,7 @@ def upload_csv_replace():
     temp_col = db[temp_name]
     inserted = skipped = 0
     ops = []
-    batch_size = 1000
+    batch_size = 500
 
     try:
         # 1) 인코딩 자동 시도 + 헤더 정규화
