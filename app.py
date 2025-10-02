@@ -1,14 +1,15 @@
-# app.py — Replace(전체 교체) + 조회 API
+# app.py — 조회 API + CSV Replace 업로드(임시 스왑) + 인코딩/헤더 정규화
 
+import os, io, csv, time
 from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
 from pymongo import MongoClient, InsertOne
 from pymongo.errors import BulkWriteError
+from pymongo.collation import Collation
 from bson import json_util
-import os, io, csv, time
 
 app = Flask(__name__)
-# 운영시 origin 제한 권장: CORS(app, resources={r"/*": {"origins": ["https://<your-gh>.github.io"]}})
+# 운영에서는 origin 제한을 권장: CORS(app, resources={r"/*": {"origins": ["https://<your-gh>.github.io"]}})
 CORS(app)
 
 # ===== Mongo 연결 =====
@@ -32,11 +33,13 @@ if CONNECTION_STRING:
 else:
     print("환경변수 MONGO_URI가 설정되지 않았습니다.")
 
+
 def dumps_json(obj):
+    """ObjectId/Datetime 안전 직렬화 응답"""
     return Response(json_util.dumps(obj, ensure_ascii=False), mimetype="application/json")
 
 
-# ===== 조회 API =====
+# ===== 기본/헬스 =====
 @app.get("/")
 def home():
     return "API 서버가 정상 작동 중입니다." if client else "DB 연결 실패"
@@ -49,10 +52,16 @@ def healthz():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# unique_id 검색 (프론트에서 대문자 변환하여 호출)
-from pymongo.collation import Collation
+
+# ===== 조회 API =====
 @app.get("/search")
 def search_by_unique_id():
+    """
+    쿼리:
+      - unique_id (또는 id) : 필수 (프론트에서 대문자 변환하여 호출 권장)
+      - page / limit        : 선택 (기본 1, 200 / 최대 1000)
+    응답: [{unique_id, 날짜, 시간, 인증샷 시리얼넘버}] (ts로 정렬)
+    """
     if client is None or collection is None:
         return jsonify({"ok": False, "error": "DB 연결 실패"}), 500
 
@@ -60,7 +69,6 @@ def search_by_unique_id():
     if not unique_id:
         return dumps_json([])
 
-    # 페이지네이션
     try:
         page = max(int(request.args.get("page", 1)), 1)
     except Exception:
@@ -73,6 +81,7 @@ def search_by_unique_id():
 
     pipeline = [
         {"$match": {"unique_id": unique_id}},
+        # '0:39' 같은 한 자리 시간을 '00:39'로 패딩 후 날짜+시간을 ts로 파싱
         {"$addFields": {
             "_padded_time": {
                 "$cond": [
@@ -106,9 +115,10 @@ def search_by_unique_id():
     docs = list(collection.aggregate(pipeline))
     return dumps_json(docs)
 
-# 시리얼 검색(정확 일치)
+
 @app.get("/search-serial")
 def search_by_serial():
+    """시리얼 정확 일치 검색"""
     if client is None or collection is None:
         return jsonify({"ok": False, "error": "DB 연결 실패"}), 500
 
@@ -124,12 +134,12 @@ def search_by_serial():
     return dumps_json(docs)
 
 
-# ===== 관리자: CSV Replace (전체 교체) =====
+# ===== 관리자 업로드(Replace) =====
 
 REQUIRED_HEADERS = {"unique_id", "날짜", "시간", "인증샷 시리얼넘버"}
 
 def _normalize_row_strict(row: dict) -> dict:
-    # 공백 제거, unique_id는 대문자화
+    """필수 4컬럼만 사용, 공백 제거, unique_id 대문자화"""
     return {
         "unique_id": (row["unique_id"] or "").strip().upper(),
         "날짜": (row["날짜"] or "").strip(),
@@ -137,14 +147,53 @@ def _normalize_row_strict(row: dict) -> dict:
         "인증샷 시리얼넘버": (row["인증샷 시리얼넘버"] or "").strip(),
     }
 
-def _ensure_indexes(col, unique_serial=False):
-    # 조회 성능용 인덱스
+def _ensure_indexes(col, unique_serial: bool = False):
+    """조회 성능 및(선택) 시리얼 고유 보장"""
     col.create_index("unique_id")
     if unique_serial:
-        # 진짜 고유 보장(중복 있으면 생성 실패 가능)
         col.create_index("인증샷 시리얼넘버", unique=True)
     else:
         col.create_index("인증샷 시리얼넘버")
+
+def _open_csv_reader_with_fallback(file_storage, preferred_encoding="utf-8"):
+    """
+    UTF-8/UTF-8-SIG/CP949/EUC-KR 순으로 디코딩 시도.
+    성공하는 csv.DictReader와 사용 인코딩을 반환.
+    """
+    order = []
+    if preferred_encoding:
+        pe = preferred_encoding.lower()
+        if pe == "utf-8":
+            order = ["utf-8", "utf-8-sig", "cp949", "euc-kr"]
+        elif pe == "cp949":
+            order = ["cp949", "utf-8", "utf-8-sig", "euc-kr"]
+        else:
+            order = [pe, "utf-8", "utf-8-sig", "cp949", "euc-kr"]
+    else:
+        order = ["utf-8", "utf-8-sig", "cp949", "euc-kr"]
+
+    last_error = None
+    for enc in order:
+        try:
+            file_storage.stream.seek(0)
+            text = io.TextIOWrapper(file_storage.stream, encoding=enc, newline="")
+            reader = csv.DictReader(text)
+            _ = reader.fieldnames  # 헤더 로드해 디코딩 확인
+            return reader, enc
+        except UnicodeDecodeError as e:
+            last_error = e
+            continue
+    raise last_error or UnicodeDecodeError("encoding", b"", 0, 1, "unknown")
+
+def _normalize_headers(raw_fields):
+    """
+    헤더에서 BOM/앞뒤 공백 제거.
+    ['\\ufeffunique_id',' 날짜 '] -> ['unique_id','날짜']
+    """
+    raw_fields = raw_fields or []
+    norm = [ (f or "").strip().lstrip("\ufeff") for f in raw_fields ]
+    return norm
+
 
 @app.get("/admin")
 def admin_form():
@@ -171,19 +220,21 @@ def admin_form():
   </div><br>
   <button type="submit">업로드 시작 (Replace)</button>
 </form>
-<p>CSV 헤더는 <code>unique_id, 날짜, 시간, 인증샷 시리얼넘버</code> 네 가지를 정확히 사용해야 합니다. (순서는 무관)</p>
+<p>CSV 헤더는 <code>unique_id, 날짜, 시간, 인증샷 시리얼넘버</code> 4개를 사용합니다(순서 무관).<br/>
+BOM이나 공백이 있어도 자동 정리합니다.</p>
 """
+
 
 @app.post("/admin/upload-csv-replace")
 def upload_csv_replace():
-    # 0) 권한
+    # 권한
     token = (request.form.get("token") or request.headers.get("X-Admin-Token") or "").strip()
     if token != os.environ.get("ADMIN_TOKEN", ""):
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
     if client is None or collection is None:
         return jsonify({"ok": False, "error": "DB 연결 실패"}), 500
 
-    # 1) 입력
+    # 입력
     file = request.files.get("file")
     if not file:
         return jsonify({"ok": False, "error": "파일이 없습니다."}), 400
@@ -201,21 +252,37 @@ def upload_csv_replace():
     batch_size = 1000
 
     try:
-        # 2) 헤더 검증 + 스트리밍 적재
-        text = io.TextIOWrapper(file.stream, encoding=encoding, newline="")
-        reader = csv.DictReader(text)
-
-        fieldset = set(reader.fieldnames or [])
-        if REQUIRED_HEADERS - fieldset:
+        # 1) 인코딩 자동 시도 + 헤더 정규화
+        reader, used_enc = _open_csv_reader_with_fallback(file, preferred_encoding=encoding)
+        norm_fields = _normalize_headers(reader.fieldnames)
+        if not REQUIRED_HEADERS.issubset(set(norm_fields)):
             return jsonify({
                 "ok": False,
                 "error": "CSV 헤더 불일치",
                 "required": sorted(REQUIRED_HEADERS),
-                "got": list(reader.fieldnames or [])
+                "got": norm_fields,
+                "encoding_used": used_enc
             }), 400
 
+        # 정규화된 헤더로 다시 Reader 구성 (BOM/공백 제거된 헤더 강제 적용)
+        file.stream.seek(0)
+        text_raw = io.TextIOWrapper(file.stream, encoding=used_enc, newline="")
+        header_line = text_raw.readline()  # 원본 헤더 라인 건너뛰기
+        rest = text_raw.read()
+        fixed_header = ",".join(norm_fields) + "\n"
+        fixed_text = io.StringIO(fixed_header + rest)
+        reader = csv.DictReader(fixed_text)
+
+        # 2) 임시 컬렉션 적재 ( streaming + bulk )
         for row in reader:
-            doc = _normalize_row_strict(row)
+            # 다른 여분 컬럼은 무시하고 필수 4개만 사용
+            safe_row = {
+                "unique_id": row.get("unique_id", ""),
+                "날짜": row.get("날짜", ""),
+                "시간": row.get("시간", ""),
+                "인증샷 시리얼넘버": row.get("인증샷 시리얼넘버", "")
+            }
+            doc = _normalize_row_strict(safe_row)
             # 필수값 검증(빈 값은 스킵)
             if not doc["unique_id"] or not doc["날짜"] or not doc["시간"]:
                 skipped += 1
@@ -245,15 +312,18 @@ def upload_csv_replace():
             "mode": "replace",
             "inserted": inserted,
             "skipped": skipped,
-            "backup": backup_name
+            "backup": backup_name,
+            "encoding_used": used_enc
         })
 
     except BulkWriteError as bwe:
         return jsonify({"ok": False, "error": "Bulk write error", "detail": bwe.details}), 500
+    except UnicodeDecodeError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
 if __name__ == "__main__":
-    # Render 등에서는 gunicorn 사용 권장: gunicorn app:app --bind 0.0.0.0:$PORT
+    # 로컬 테스트용 (Render에서는 gunicorn 사용)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
