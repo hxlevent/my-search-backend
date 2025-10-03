@@ -306,6 +306,119 @@ def admin_job_status():
     out["eta_secs"] = eta
     return jsonify({"ok": True, "job": out})
 
+# ===== 관리자 요약 API =====
+# GET /admin/summary?token=...&page=1&limit=100&q=AA
+@app.get("/admin/summary")
+def admin_summary():
+    token = (request.args.get("token") or request.headers.get("X-Admin-Token") or "").strip()
+    if token != os.environ.get("ADMIN_TOKEN", ""):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    if client is None or collection is None:
+        return jsonify({"ok": False, "error": "DB 연결 실패"}), 500
+
+    # 페이지네이션
+    try:
+        page = max(int(request.args.get("page", 1)), 1)
+    except Exception:
+        page = 1
+    try:
+        limit = min(max(int(request.args.get("limit", 100)), 1), 1000)
+    except Exception:
+        limit = 100
+    skip = (page - 1) * limit
+
+    # optional prefix 필터 (대문자 기준)
+    q = (request.args.get("q") or "").strip().upper()
+    match_uid = {"unique_id": {"$regex": f"^{q}"}} if q else {}
+
+    pipeline = [
+        {"$match": match_uid} if match_uid else {"$match": {}},
+        # 시간 "0:39" 패딩 → 분으로 계산
+        {"$addFields": {
+            "_padded_time": {
+                "$cond": [
+                    {"$lt": [{"$strLenCP": "$시간"}, 5]},
+                    {"$concat": ["0", "$시간"]},
+                    "$시간"
+                ]
+            }
+        }},
+        {"$addFields": {
+            "minOfDay": {  # 0~1439
+                "$let": {
+                    "vars": {
+                        "h": {"$toInt": {"$arrayElemAt": [{"$split": ["$_padded_time", ":" ]}, 0]}},
+                        "m": {"$toInt": {"$arrayElemAt": [{"$split": ["$_padded_time", ":" ]}, 1]}},
+                    },
+                    "in": {"$add": [{"$multiply": ["$$h", 60]}, "$$m"]}
+                }
+            }
+        }},
+        # unique_id별 집계
+        {"$group": {
+            "_id": "$unique_id",
+            "c19": {"$sum": {"$cond": [{"$eq": ["$날짜", "2025.09.19"]}, 1, 0]}},
+            "c20": {"$sum": {"$cond": [{"$eq": ["$날짜", "2025.09.20"]}, 1, 0]}},
+            "c21": {"$sum": {"$cond": [{"$eq": ["$날짜", "2025.09.21"]}, 1, 0]}},
+            "c22": {"$sum": {"$cond": [{"$eq": ["$날짜", "2025.09.22"]}, 1, 0]}},
+            "c23": {"$sum": {"$cond": [{"$eq": ["$날짜", "2025.09.23"]}, 1, 0]}},
+            "c24": {"$sum": {"$cond": [{"$eq": ["$날짜", "2025.09.24"]}, 1, 0]}},
+            # 25일 1차: 00:00~09:59
+            "c25_first": {"$sum": {"$cond": [
+                {"$and": [
+                    {"$eq": ["$날짜", "2025.09.25"]},
+                    {"$lte": ["$minOfDay", 599]}
+                ]}, 1, 0]}},
+            # 생방: 12:00~23:59
+            "c_live": {"$sum": {"$cond": [
+                {"$and": [
+                    {"$eq": ["$날짜", "2025.09.25"]},
+                    {"$gte": ["$minOfDay", 720]}
+                ]}, 1, 0]}},
+        }},
+        {"$addFields": {
+            "pre_total": {"$add": ["$c19","$c20","$c21","$c22","$c23","$c24","$c25_first"]},
+            "perfect": {"$and": [
+                {"$gt": ["$c19", 0]},
+                {"$gt": ["$c20", 0]},
+                {"$gt": ["$c21", 0]},
+                {"$gt": ["$c22", 0]},
+                {"$gt": ["$c23", 0]},
+                {"$gt": ["$c24", 0]},
+                {"$gt": ["$c25_first", 0]},
+            ]}
+        }},
+        {"$project": {
+            "_id": 0,
+            "unique_id": "$_id",
+            "c19": 1, "c20": 1, "c21": 1, "c22": 1, "c23": 1, "c24": 1,
+            "c25_first": 1, "c_live": 1, "pre_total": 1, "perfect": 1
+        }},
+        {"$sort": {"unique_id": 1}},
+        {"$skip": skip},
+        {"$limit": limit}
+    ]
+
+    rows = list(collection.aggregate(pipeline))
+
+    # 총 unique_id 수
+    total_unique = len(collection.distinct("unique_id", match_uid) if match_uid else collection.distinct("unique_id"))
+
+    return jsonify({
+        "ok": True,
+        "page": page,
+        "limit": limit,
+        "count": len(rows),
+        "total_unique": total_unique,
+        "rows": rows
+    })
+
+
+
+
+
+
+
 # ----------------------------
 # 실제 Replace 작업 (백그라운드)
 # ----------------------------
