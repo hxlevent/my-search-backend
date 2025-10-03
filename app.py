@@ -451,6 +451,133 @@ def admin_summary():
 
 
 
+from flask import stream_with_context
+
+@app.get("/admin/summary-export")
+def admin_summary_export():
+    # 1) 인증
+    token = (request.args.get("token") or request.headers.get("X-Admin-Token") or "").strip()
+    if token != os.environ.get("ADMIN_TOKEN", ""):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    if client is None or collection is None:
+        return jsonify({"ok": False, "error": "DB 연결 실패"}), 500
+
+    # 2) 접두어 필터(선택)
+    q = (request.args.get("q") or "").strip().upper()
+    uid_filter = {"unique_id": {"$regex": f"^{q}"}} if q else {}
+
+    # 3) unique_id 전체를 메모리에 한 번에 담지 말고 cursor로 배치 처리
+    #    group → sort 하면 distinct 역할 + 정렬 가능
+    id_pipeline = []
+    if uid_filter:
+        id_pipeline.append({"$match": uid_filter})
+    id_pipeline += [
+        {"$group": {"_id": "$unique_id"}},
+        {"$sort": {"_id": 1}},
+        {"$project": {"_id": 0, "unique_id": "$_id"}}
+    ]
+    id_cursor = collection.aggregate(id_pipeline, allowDiskUse=True)
+
+    def gen_rows_for_ids(id_batch):
+        # 기존 요약 파이프라인에서 '해당 ID들만' 집계
+        agg = [
+            {"$match": {"unique_id": {"$in": id_batch}}},
+            {"$addFields": {"_t": {"$ifNull": ["$시간", "00:00"]}}},
+            {"$addFields": {
+                "_padded_time": {
+                    "$cond": [
+                        {"$lt": [{"$strLenCP": "$_t"}, 5]},
+                        {"$concat": ["0", "$_t"]},
+                        "$_t"
+                    ]
+                }
+            }},
+            {"$addFields": {
+                "minOfDay": {
+                    "$let": {
+                        "vars": {
+                            "h": {"$ifNull": [{"$arrayElemAt": [{"$split": ["$_padded_time", ":" ]}, 0]}, "0"]},
+                            "m": {"$ifNull": [{"$arrayElemAt": [{"$split": ["$_padded_time", ":" ]}, 1]}, "0"]},
+                        },
+                        "in": {
+                            "$add": [
+                                {"$multiply": [
+                                    {"$toInt": {"$cond": [{"$regexMatch": {"input": "$$h", "regex": r"^\d+$"}}, "$$h", "0"]}},
+                                    60
+                                ]},
+                                {"$toInt": {"$cond": [{"$regexMatch": {"input": "$$m", "regex": r"^\d+$"}}, "$$m", "0"]}}
+                            ]
+                        }
+                    }
+                }
+            }},
+            {"$group": {
+                "_id": "$unique_id",
+                "c19": {"$sum": {"$cond": [{"$eq": ["$날짜", "2025.09.19"]}, 1, 0]}},
+                "c20": {"$sum": {"$cond": [{"$eq": ["$날짜", "2025.09.20"]}, 1, 0]}},
+                "c21": {"$sum": {"$cond": [{"$eq": ["$날짜", "2025.09.21"]}, 1, 0]}},
+                "c22": {"$sum": {"$cond": [{"$eq": ["$날짜", "2025.09.22"]}, 1, 0]}},
+                "c23": {"$sum": {"$cond": [{"$eq": ["$날짜", "2025.09.23"]}, 1, 0]}},
+                "c24": {"$sum": {"$cond": [{"$eq": ["$날짜", "2025.09.24"]}, 1, 0]}},
+                "c25_first": {"$sum": {"$cond": [
+                    {"$and": [
+                        {"$eq": ["$날짜", "2025.09.25"]},
+                        {"$lte": ["$minOfDay", 599]}
+                    ]}, 1, 0]}},
+                "c_live": {"$sum": {"$cond": [
+                    {"$and": [
+                        {"$eq": ["$날짜", "2025.09.25"]},
+                        {"$gte": ["$minOfDay", 720]}
+                    ]}, 1, 0]}},
+            }},
+            {"$project": {
+                "_id": 0,
+                "unique_id": "$_id",
+                "c19": 1, "c20": 1, "c21": 1, "c22": 1, "c23": 1, "c24": 1,
+                "c25_first": 1, "c_live": 1
+            }},
+            {"$sort": {"unique_id": 1}}
+        ]
+        for r in collection.aggregate(agg, allowDiskUse=True):
+            pre_total = sum([r.get("c19",0), r.get("c20",0), r.get("c21",0),
+                             r.get("c22",0), r.get("c23",0), r.get("c24",0), r.get("c25_first",0)])
+            perfect = all([
+                r.get("c19",0)>0, r.get("c20",0)>0, r.get("c21",0)>0,
+                r.get("c22",0)>0, r.get("c23",0)>0, r.get("c24",0)>0,
+                r.get("c25_first",0)>0
+            ])
+            yield [
+                r["unique_id"], r.get("c19",0), r.get("c20",0), r.get("c21",0),
+                r.get("c22",0), r.get("c23",0), r.get("c24",0),
+                r.get("c25_first",0), r.get("c_live",0), pre_total, "O" if perfect else "X"
+            ]
+
+    def generate():
+        # CSV 헤더
+        header = ["unique_id","c19","c20","c21","c22","c23","c24","c25_first","c_live","pre_total","perfect"]
+        yield ",".join(header) + "\n"
+
+        batch = []
+        batch_size = 1000  # 메모리/성능 밸런스. 2~5천으로 올려도 됨.
+        for d in id_cursor:
+            batch.append(d["unique_id"])
+            if len(batch) >= batch_size:
+                for row in gen_rows_for_ids(batch):
+                    yield ",".join(map(str, row)) + "\n"
+                batch.clear()
+        if batch:
+            for row in gen_rows_for_ids(batch):
+                yield ",".join(map(str, row)) + "\n"
+
+    resp = Response(stream_with_context(generate()), mimetype="text/csv; charset=utf-8")
+    resp.headers["Content-Disposition"] = "attachment; filename=summary_all.csv"
+    return resp
+
+
+
+
+
+
 
 
 
