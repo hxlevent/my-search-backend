@@ -327,34 +327,77 @@ def admin_summary():
         limit = 100
     skip = (page - 1) * limit
 
-    # optional prefix 필터 (대문자 기준)
+    # 접두어 필터(대문자)
     q = (request.args.get("q") or "").strip().upper()
-    match_uid = {"unique_id": {"$regex": f"^{q}"}} if q else {}
+    uid_filter = {"unique_id": {"$regex": f"^{q}"}} if q else {}
 
-    pipeline = [
-        {"$match": match_uid} if match_uid else {"$match": {}},
-        # 시간 "0:39" 패딩 → 분으로 계산
+    # --- Step 1) 페이지에 들어갈 unique_id만 선(先) 추출 ---
+    # 큰 컬렉션 전체를 매번 group하지 않도록, ID 목록만 먼저 뽑는다.
+    ids_stage = []
+    if uid_filter:
+        ids_stage.append({"$match": uid_filter})
+    ids_stage += [
+        {"$group": {"_id": "$unique_id"}},      # distinct unique_id
+        {"$sort": {"_id": 1}},
+        {"$skip": skip},
+        {"$limit": limit},
+        {"$project": {"_id": 0, "unique_id": "$_id"}}
+    ]
+    page_ids = [d["unique_id"] for d in collection.aggregate(ids_stage)]
+    if not page_ids:
+        # total_unique 계산 (필터 적용) — group + count는 distinct보다 가벼움
+        count_pipeline = []
+        if uid_filter:
+            count_pipeline.append({"$match": uid_filter})
+        count_pipeline += [{"$group": {"_id": "$unique_id"}}, {"$count": "n"}]
+        cnt_doc = next(iter(collection.aggregate(count_pipeline)), {"n": 0})
+        return jsonify({
+            "ok": True, "page": page, "limit": limit, "count": 0,
+            "total_unique": cnt_doc.get("n", 0),
+            "rows": []
+        })
+
+    # --- 총 unique_id 수 (필터 적용) ---
+    count_pipeline = []
+    if uid_filter:
+        count_pipeline.append({"$match": uid_filter})
+    count_pipeline += [{"$group": {"_id": "$unique_id"}}, {"$count": "n"}]
+    cnt_doc = next(iter(collection.aggregate(count_pipeline)), {"n": None})
+    total_unique = cnt_doc.get("n", None)
+
+    # --- Step 2) 해당 페이지의 ID들만 집계 ---
+    # 시간 필드가 비어있거나 형식이 다른 경우도 안전 처리
+    agg = [
+        {"$match": {"unique_id": {"$in": page_ids}}},
+        {"$addFields": {"_t": {"$ifNull": ["$시간", "00:00"]}}},
         {"$addFields": {
             "_padded_time": {
                 "$cond": [
-                    {"$lt": [{"$strLenCP": "$시간"}, 5]},
-                    {"$concat": ["0", "$시간"]},
-                    "$시간"
+                    {"$lt": [{"$strLenCP": "$_t"}, 5]},
+                    {"$concat": ["0", "$_t"]},
+                    "$_t"
                 ]
             }
         }},
         {"$addFields": {
-            "minOfDay": {  # 0~1439
+            "minOfDay": {
                 "$let": {
                     "vars": {
-                        "h": {"$toInt": {"$arrayElemAt": [{"$split": ["$_padded_time", ":" ]}, 0]}},
-                        "m": {"$toInt": {"$arrayElemAt": [{"$split": ["$_padded_time", ":" ]}, 1]}},
+                        "h": {"$ifNull": [{"$arrayElemAt": [{"$split": ["$_padded_time", ":" ]}, 0]}, "0"]},
+                        "m": {"$ifNull": [{"$arrayElemAt": [{"$split": ["$_padded_time", ":" ]}, 1]}, "0"]},
                     },
-                    "in": {"$add": [{"$multiply": ["$$h", 60]}, "$$m"]}
+                    "in": {
+                        "$add": [
+                            {"$multiply": [
+                                {"$toInt": {"$cond": [{"$regexMatch": {"input": "$$h", "regex": r"^\d+$"}}, "$$h", "0"]}},
+                                60
+                            ]},
+                            {"$toInt": {"$cond": [{"$regexMatch": {"input": "$$m", "regex": r"^\d+$"}}, "$$m", "0"]}}
+                        ]
+                    }
                 }
             }
         }},
-        # unique_id별 집계
         {"$group": {
             "_id": "$unique_id",
             "c19": {"$sum": {"$cond": [{"$eq": ["$날짜", "2025.09.19"]}, 1, 0]}},
@@ -363,46 +406,38 @@ def admin_summary():
             "c22": {"$sum": {"$cond": [{"$eq": ["$날짜", "2025.09.22"]}, 1, 0]}},
             "c23": {"$sum": {"$cond": [{"$eq": ["$날짜", "2025.09.23"]}, 1, 0]}},
             "c24": {"$sum": {"$cond": [{"$eq": ["$날짜", "2025.09.24"]}, 1, 0]}},
-            # 25일 1차: 00:00~09:59
             "c25_first": {"$sum": {"$cond": [
                 {"$and": [
                     {"$eq": ["$날짜", "2025.09.25"]},
                     {"$lte": ["$minOfDay", 599]}
                 ]}, 1, 0]}},
-            # 생방: 12:00~23:59
             "c_live": {"$sum": {"$cond": [
                 {"$and": [
                     {"$eq": ["$날짜", "2025.09.25"]},
                     {"$gte": ["$minOfDay", 720]}
                 ]}, 1, 0]}},
         }},
-        {"$addFields": {
-            "pre_total": {"$add": ["$c19","$c20","$c21","$c22","$c23","$c24","$c25_first"]},
-            "perfect": {"$and": [
-                {"$gt": ["$c19", 0]},
-                {"$gt": ["$c20", 0]},
-                {"$gt": ["$c21", 0]},
-                {"$gt": ["$c22", 0]},
-                {"$gt": ["$c23", 0]},
-                {"$gt": ["$c24", 0]},
-                {"$gt": ["$c25_first", 0]},
-            ]}
-        }},
         {"$project": {
             "_id": 0,
             "unique_id": "$_id",
             "c19": 1, "c20": 1, "c21": 1, "c22": 1, "c23": 1, "c24": 1,
-            "c25_first": 1, "c_live": 1, "pre_total": 1, "perfect": 1
-        }},
-        {"$sort": {"unique_id": 1}},
-        {"$skip": skip},
-        {"$limit": limit}
+            "c25_first": 1, "c_live": 1
+        }}
     ]
+    rows = list(collection.aggregate(agg))
 
-    rows = list(collection.aggregate(pipeline))
-
-    # 총 unique_id 수
-    total_unique = len(collection.distinct("unique_id", match_uid) if match_uid else collection.distinct("unique_id"))
+    # 페이지 ID 순서에 맞춰 정렬 + 파생값 계산
+    idx = {u: i for i, u in enumerate(page_ids)}
+    rows.sort(key=lambda r: idx.get(r["unique_id"], 1e9))
+    for r in rows:
+        r["pre_total"] = sum([r.get("c19",0), r.get("c20",0), r.get("c21",0),
+                              r.get("c22",0), r.get("c23",0), r.get("c24",0),
+                              r.get("c25_first",0)])
+        r["perfect"] = all([
+            r.get("c19",0)>0, r.get("c20",0)>0, r.get("c21",0)>0,
+            r.get("c22",0)>0, r.get("c23",0)>0, r.get("c24",0)>0,
+            r.get("c25_first",0)>0
+        ])
 
     return jsonify({
         "ok": True,
