@@ -1,17 +1,19 @@
 # app.py — 검색 API + 관리자 CSV Replace(비동기) + 진행률 폴링
 
 import os, io, csv, time, uuid, threading
-from flask import Flask, jsonify, request, Response
+from flask import Flask, jsonify, request, Response, stream_with_context
 from flask_cors import CORS
 from bson import json_util
-from pymongo import MongoClient, InsertOne
+from pymongo import MongoClient, UpdateOne, DeleteOne
 from pymongo.write_concern import WriteConcern
+from bson import ObjectId
+from pymongo.errors import BulkWriteError
 
 # ----------------------------
 # Flask / CORS
 # ----------------------------
 app = Flask(__name__)
-# 운영에서는 origins를 GitHub Pages 도메인으로 제한 권장
+# 운영 배포 시 화이트리스트 권장
 # CORS(app, resources={r"/*": {"origins": ["https://<your-gh>.github.io"]}})
 CORS(app)
 
@@ -31,13 +33,26 @@ if CONNECTION_STRING:
             CONNECTION_STRING,
             serverSelectionTimeoutMS=5000,
             connectTimeoutMS=20000,
-            socketTimeoutMS=600000,  # 긴 업로드 대비 10분
+            socketTimeoutMS=600000,  # 긴 업로드 대비
             retryWrites=True,
         )
         db = client[DB_NAME]
         collection = db[COLLECTION_NAME]
         client.admin.command("ping")
         print("MongoDB 연결 성공!")
+
+        # === 인덱스 ===
+        # 1) 중복 판정 키: unique_id + 날짜 + 시간 + 인증샷 시리얼넘버
+        collection.create_index(
+            [("unique_id", 1), ("날짜", 1), ("시간", 1), ("인증샷 시리얼넘버", 1)],
+            name="uk_uid_date_time_serial",
+            unique=True,
+        )
+        # 2) UID별 시간 정렬 최적화
+        collection.create_index([("unique_id", 1), ("날짜", 1), ("시간", 1)], name="idx_uid_date_time")
+        # 3) 시리얼 정확 검색
+        collection.create_index([("인증샷 시리얼넘버", 1)], name="idx_serial")
+
     except Exception as e:
         print(f"MongoDB 연결 실패: {e}")
         client = None
@@ -60,7 +75,7 @@ def _update_job(job_id, **kw):
         JOBS[job_id].update(kw)
 
 def _count_csv_lines_fast(path, encoding):
-    """헤더 1줄 제외한 데이터 라인 수(대략치)"""
+    """헤더 1줄 제외한 대략 라인 수"""
     cnt = 0
     with open(path, "r", encoding=encoding, newline="") as f:
         for _ in f:
@@ -70,11 +85,8 @@ def _count_csv_lines_fast(path, encoding):
 REQUIRED_HEADERS = {"unique_id", "날짜", "시간", "인증샷 시리얼넘버"}
 
 def _normalize_headers_map(raw_fields):
-    """
-    헤더 정규화 맵: 원본키 -> 정규키
-    '\ufeffunique_id' / ' 날짜 ' -> 'unique_id' / '날짜'
-    """
-    return { (f or ""): (f or "").strip().lstrip("\ufeff") for f in (raw_fields or []) }
+    """헤더 정규화: '\ufeffunique_id' / ' 날짜 ' -> 'unique_id' / '날짜'"""
+    return {(f or ""): (f or "").strip().lstrip("\ufeff") for f in (raw_fields or [])}
 
 # ----------------------------
 # 헬스/루트
@@ -98,7 +110,7 @@ def healthz():
 def search_by_unique_id():
     """
     쿼리:
-      - unique_id (또는 id) : 필수 (프론트에서 대문자 변환하여 호출 권장)
+      - unique_id (또는 id) : 필수
       - page / limit        : 선택 (기본 1, 200 / 최대 1000)
     응답: [{unique_id, 날짜, 시간, 인증샷 시리얼넘버}] (날짜+시간 정렬)
     """
@@ -108,6 +120,8 @@ def search_by_unique_id():
     unique_id = request.args.get("unique_id") or request.args.get("id")
     if not unique_id:
         return dumps_json([])
+
+    unique_id = unique_id.strip().upper()
 
     try:
         page = max(int(request.args.get("page", 1)), 1)
@@ -119,15 +133,15 @@ def search_by_unique_id():
         limit = 200
     skip = (page - 1) * limit
 
-    # 날짜/시간을 ts로 파싱해 정렬 (0:39 → 00:39 패딩)
     pipeline = [
         {"$match": {"unique_id": unique_id}},
+        {"$addFields": {"_t": {"$ifNull": ["$시간", "00:00"]}}},
         {"$addFields": {
             "_padded_time": {
                 "$cond": [
-                    {"$lt": [{"$strLenCP": "$시간"}, 5]},
-                    {"$concat": ["0", "$시간"]},
-                    "$시간"
+                    {"$lt": [{"$strLenCP": "$_t"}, 5]},
+                    {"$concat": ["0", "$_t"]},
+                    "$_t"
                 ]
             }
         }},
@@ -144,24 +158,142 @@ def search_by_unique_id():
         {"$sort": {"ts": 1, "_id": 1}},
         {"$skip": skip},
         {"$limit": limit},
-        {"$project": {
-            "_id": 0,
-            "unique_id": 1,
-            "날짜": 1,
-            "시간": 1,
-            "인증샷 시리얼넘버": 1
-        }}
+        {"$project": {"_id": 0, "unique_id": 1, "날짜": 1, "시간": 1, "인증샷 시리얼넘버": 1}},
     ]
-    docs = list(collection.aggregate(pipeline))
+    docs = list(collection.aggregate(pipeline, allowDiskUse=True))
     return dumps_json(docs)
 
-@app.get("/search-serial")
-def search_by_serial():
-    """시리얼 정확 일치 검색 (인덱스 없이도 동작; 데이터량 수준에서 충분)"""
+@app.get("/admin/records")
+def admin_list_records():
+    # 토큰 검증
+    token = (request.args.get("token") or request.headers.get("X-Admin-Token") or "").strip()
+    if token != os.environ.get("ADMIN_TOKEN", ""):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
     if client is None or collection is None:
         return jsonify({"ok": False, "error": "DB 연결 실패"}), 500
 
-    serial = request.args.get("serial")
+    uid = (request.args.get("unique_id") or "").strip().upper()
+    date_from = (request.args.get("from") or "").strip()
+    date_to   = (request.args.get("to") or "").strip()
+
+    q = {}
+    if uid: q["unique_id"] = uid
+    if date_from or date_to:
+        q["날짜"] = {}
+        if date_from: q["날짜"]["$gte"] = date_from  # 예: "2025.09.19"
+        if date_to:   q["날짜"]["$lte"] = date_to
+
+    pipeline = [
+        {"$match": q},
+        {"$addFields": {"_t": {"$ifNull": ["$시간", "00:00"]}}},
+        {"$addFields": {
+            "_padded_time": {
+                "$cond": [
+                    {"$lt": [{"$strLenCP": "$_t"}, 5]},
+                    {"$concat": ["0", "$_t"]},
+                    "$_t"
+                ]
+            }
+        }},
+        {"$addFields": {
+            "ts": {
+                "$dateFromString": {
+                    "dateString": {"$concat": ["$날짜", " ", "$_padded_time"]},
+                    "format": "%Y.%m.%d %H:%M",
+                    "onError": None,
+                    "onNull": None
+                }
+            }
+        }},
+        {"$sort": {"ts": 1, "_id": 1}},
+        {"$project": {
+            "_id": {"$toString": "$_id"},
+            "unique_id": 1, "날짜": 1, "시간": 1, "인증샷 시리얼넘버": 1
+        }},
+    ]
+
+    docs = list(collection.aggregate(pipeline, allowDiskUse=True))
+    return dumps_json({"ok": True, "rows": docs})
+
+@app.post("/admin/records/bulk")
+def admin_bulk_records():
+    # 토큰 검증
+    token = (request.args.get("token") or request.headers.get("X-Admin-Token") or "").strip()
+    if token != os.environ.get("ADMIN_TOKEN", ""):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    if client is None or collection is None:
+        return jsonify({"ok": False, "error": "DB 연결 실패"}), 500
+
+    payload = request.get_json(force=True) or {}
+    inserts = payload.get("insert", []) or []
+    updates = payload.get("update", []) or []
+    deletes = payload.get("delete", []) or []
+
+    ops = []
+
+    # INSERT: (unique_id, 날짜, 시간, 인증샷 시리얼넘버) 기준 upsert
+    for r in inserts:
+        uid = (r.get("unique_id") or "").strip().upper()
+        d   = (r.get("날짜") or "").strip()
+        t   = (r.get("시간") or "").strip()
+        srl = (r.get("인증샷 시리얼넘버") or "").strip()
+        if not uid or not d or not t or not srl:
+            continue
+        doc = {"unique_id": uid, "날짜": d, "시간": t, "인증샷 시리얼넘버": srl}
+        ops.append(UpdateOne(
+            {"unique_id": uid, "날짜": d, "시간": t, "인증샷 시리얼넘버": srl},
+            {"$set": doc},
+            upsert=True
+        ))
+
+    # UPDATE: _id 기반 부분 업데이트 (유니크 충돌 시 BulkWriteError로 처리됨)
+    for r in updates:
+        _id = r.get("_id")
+        try:
+            oid = ObjectId(_id)
+        except Exception:
+            continue
+        fields = {}
+        if "unique_id" in r: fields["unique_id"] = (r["unique_id"] or "").strip().upper()
+        if "날짜" in r:       fields["날짜"] = (r["날짜"] or "").strip()
+        if "시간" in r:       fields["시간"] = (r["시간"] or "").strip()
+        if "인증샷 시리얼넘버" in r: fields["인증샷 시리얼넘버"] = (r["인증샷 시리얼넘버"] or "").strip()
+        if fields:
+            ops.append(UpdateOne({"_id": oid}, {"$set": fields}, upsert=False))
+
+    # DELETE: _id 배열
+    for _id in deletes:
+        try:
+            oid = ObjectId(_id)
+            ops.append(DeleteOne({"_id": oid}))
+        except Exception:
+            continue
+
+    if not ops:
+        return jsonify({"ok": True, "matched": 0, "modified": 0, "upserts": 0, "deleted": 0})
+
+    try:
+        res = collection.bulk_write(ops, ordered=False)
+        return jsonify({
+            "ok": True,
+            "matched": res.matched_count,
+            "modified": res.modified_count,
+            "upserts": len(res.upserted_ids or {}),
+            "deleted": res.deleted_count,
+        })
+    except BulkWriteError as bwe:
+        details = bwe.details or {}
+        write_errors = details.get("writeErrors", [])
+        msg = write_errors[0].get("errmsg") if write_errors else str(bwe)
+        return jsonify({"ok": False, "error": f"Bulk error: {msg}"}), 400
+
+@app.get("/search-serial")
+def search_by_serial():
+    """시리얼 정확 일치 검색"""
+    if client is None or collection is None:
+        return jsonify({"ok": False, "error": "DB 연결 실패"}), 500
+
+    serial = (request.args.get("serial") or "").strip()
     if not serial:
         return dumps_json([])
 
@@ -331,8 +463,7 @@ def admin_summary():
     q = (request.args.get("q") or "").strip().upper()
     uid_filter = {"unique_id": {"$regex": f"^{q}"}} if q else {}
 
-    # --- Step 1) 페이지에 들어갈 unique_id만 선(先) 추출 ---
-    # 큰 컬렉션 전체를 매번 group하지 않도록, ID 목록만 먼저 뽑는다.
+    # --- Step 1) 페이지 unique_id 목록만 선 추출 ---
     ids_stage = []
     if uid_filter:
         ids_stage.append({"$match": uid_filter})
@@ -343,14 +474,13 @@ def admin_summary():
         {"$limit": limit},
         {"$project": {"_id": 0, "unique_id": "$_id"}}
     ]
-    page_ids = [d["unique_id"] for d in collection.aggregate(ids_stage)]
+    page_ids = [d["unique_id"] for d in collection.aggregate(ids_stage, allowDiskUse=True)]
     if not page_ids:
-        # total_unique 계산 (필터 적용) — group + count는 distinct보다 가벼움
         count_pipeline = []
         if uid_filter:
             count_pipeline.append({"$match": uid_filter})
         count_pipeline += [{"$group": {"_id": "$unique_id"}}, {"$count": "n"}]
-        cnt_doc = next(iter(collection.aggregate(count_pipeline)), {"n": 0})
+        cnt_doc = next(iter(collection.aggregate(count_pipeline, allowDiskUse=True)), {"n": 0})
         return jsonify({
             "ok": True, "page": page, "limit": limit, "count": 0,
             "total_unique": cnt_doc.get("n", 0),
@@ -362,11 +492,10 @@ def admin_summary():
     if uid_filter:
         count_pipeline.append({"$match": uid_filter})
     count_pipeline += [{"$group": {"_id": "$unique_id"}}, {"$count": "n"}]
-    cnt_doc = next(iter(collection.aggregate(count_pipeline)), {"n": None})
+    cnt_doc = next(iter(collection.aggregate(count_pipeline, allowDiskUse=True)), {"n": None})
     total_unique = cnt_doc.get("n", None)
 
     # --- Step 2) 해당 페이지의 ID들만 집계 ---
-    # 시간 필드가 비어있거나 형식이 다른 경우도 안전 처리
     agg = [
         {"$match": {"unique_id": {"$in": page_ids}}},
         {"$addFields": {"_t": {"$ifNull": ["$시간", "00:00"]}}},
@@ -424,15 +553,17 @@ def admin_summary():
             "c25_first": 1, "c_live": 1
         }}
     ]
-    rows = list(collection.aggregate(agg))
+    rows = list(collection.aggregate(agg, allowDiskUse=True))
 
     # 페이지 ID 순서에 맞춰 정렬 + 파생값 계산
     idx = {u: i for i, u in enumerate(page_ids)}
     rows.sort(key=lambda r: idx.get(r["unique_id"], 1e9))
     for r in rows:
-        r["pre_total"] = sum([r.get("c19",0), r.get("c20",0), r.get("c21",0),
-                              r.get("c22",0), r.get("c23",0), r.get("c24",0),
-                              r.get("c25_first",0)])
+        r["pre_total"] = sum([
+            r.get("c19",0), r.get("c20",0), r.get("c21",0),
+            r.get("c22",0), r.get("c23",0), r.get("c24",0),
+            r.get("c25_first",0)
+        ])
         r["perfect"] = all([
             r.get("c19",0)>0, r.get("c20",0)>0, r.get("c21",0)>0,
             r.get("c22",0)>0, r.get("c23",0)>0, r.get("c24",0)>0,
@@ -448,11 +579,6 @@ def admin_summary():
         "rows": rows
     })
 
-
-
-
-from flask import stream_with_context
-
 @app.get("/admin/summary-export")
 def admin_summary_export():
     # 1) 인증
@@ -466,8 +592,7 @@ def admin_summary_export():
     q = (request.args.get("q") or "").strip().upper()
     uid_filter = {"unique_id": {"$regex": f"^{q}"}} if q else {}
 
-    # 3) unique_id 전체를 메모리에 한 번에 담지 말고 cursor로 배치 처리
-    #    group → sort 하면 distinct 역할 + 정렬 가능
+    # 3) unique_id 전체를 커서로 배치 처리
     id_pipeline = []
     if uid_filter:
         id_pipeline.append({"$match": uid_filter})
@@ -479,7 +604,6 @@ def admin_summary_export():
     id_cursor = collection.aggregate(id_pipeline, allowDiskUse=True)
 
     def gen_rows_for_ids(id_batch):
-        # 기존 요약 파이프라인에서 '해당 ID들만' 집계
         agg = [
             {"$match": {"unique_id": {"$in": id_batch}}},
             {"$addFields": {"_t": {"$ifNull": ["$시간", "00:00"]}}},
@@ -553,12 +677,11 @@ def admin_summary_export():
             ]
 
     def generate():
-        # CSV 헤더
         header = ["unique_id","c19","c20","c21","c22","c23","c24","c25_first","c_live","pre_total","perfect"]
         yield ",".join(header) + "\n"
 
         batch = []
-        batch_size = 1000  # 메모리/성능 밸런스. 2~5천으로 올려도 됨.
+        batch_size = 1000
         for d in id_cursor:
             batch.append(d["unique_id"])
             if len(batch) >= batch_size:
@@ -573,14 +696,6 @@ def admin_summary_export():
     resp.headers["Content-Disposition"] = "attachment; filename=summary_all.csv"
     return resp
 
-
-
-
-
-
-
-
-
 # ----------------------------
 # 실제 Replace 작업 (백그라운드)
 # ----------------------------
@@ -591,11 +706,10 @@ def _run_replace_job(job_id, path, encoding):
         temp_name   = f"{target_name}_tmp_{int(time.time())}_{job_id}"
         backup_name = f"{target_name}_bak_{int(time.time())}"
 
-        # writeConcern: w=1(안전). 초고속 원하면 w=0로도 가능(실패 감지 어려움)
         temp_col = db.get_collection(temp_name, write_concern=WriteConcern(w=1))
 
         batch = []
-        batch_size = 3000  # 데이터/네트워크 상황에 맞춰 2000~5000에서 조정
+        batch_size = 3000
         inserted = skipped = processed = 0
 
         _update_job(job_id, phase="loading")
@@ -607,7 +721,6 @@ def _run_replace_job(job_id, path, encoding):
             if not REQUIRED_HEADERS.issubset(norm_set):
                 raise ValueError(f"CSV 헤더 불일치: got={list(norm_set)}")
 
-            # 원본 헤더 키 → 정규키 매핑 기반으로 값 추출
             def get(row, want):
                 for k, v in fmap.items():
                     if v == want:
@@ -621,26 +734,43 @@ def _run_replace_job(job_id, path, encoding):
                     "시간": get(row, "시간").strip(),
                     "인증샷 시리얼넘버": get(row, "인증샷 시리얼넘버").strip(),
                 }
-                if not doc["unique_id"] or not doc["날짜"] or not doc["시간"]:
+                # 4필드 모두 있어야 1건으로 인정
+                if not doc["unique_id"] or not doc["날짜"] or not doc["시간"] or not doc["인증샷 시리얼넘버"]:
                     skipped += 1
                 else:
-                    batch.append(InsertOne(doc))
+                    # 중복 라인은 upsert로 자동 병합
+                    batch.append(UpdateOne(
+                        {
+                            "unique_id": doc["unique_id"],
+                            "날짜": doc["날짜"],
+                            "시간": doc["시간"],
+                            "인증샷 시리얼넘버": doc["인증샷 시리얼넘버"],
+                        },
+                        {"$setOnInsert": doc},
+                        upsert=True
+                    ))
                     if len(batch) >= batch_size:
                         res = temp_col.bulk_write(batch, ordered=False)
-                        inserted += res.inserted_count
+                        inserted += len(res.upserted_ids or {})
                         batch.clear()
                 processed += 1
                 _update_job(job_id, processed_rows=processed, inserted=inserted, skipped=skipped)
 
         if batch:
             res = temp_col.bulk_write(batch, ordered=False)
-            inserted += res.inserted_count
+            inserted += len(res.upserted_ids or {})
             batch.clear()
             _update_job(job_id, inserted=inserted)
 
-        # 인덱스: unique_id만(시리얼 인덱스는 생성하지 않음)
+        # 인덱스 (임시콜렉션에도 최종과 동일)
         _update_job(job_id, phase="indexing")
-        temp_col.create_index("unique_id")
+        temp_col.create_index(
+            [("unique_id", 1), ("날짜", 1), ("시간", 1), ("인증샷 시리얼넘버", 1)],
+            name="uk_uid_date_time_serial",
+            unique=True,
+        )
+        temp_col.create_index([("unique_id", 1), ("날짜", 1), ("시간", 1)], name="idx_uid_date_time")
+        temp_col.create_index([("인증샷 시리얼넘버", 1)], name="idx_serial")
 
         # 스왑: 기존 → 백업, 임시 → 타깃
         _update_job(job_id, phase="swapping")
